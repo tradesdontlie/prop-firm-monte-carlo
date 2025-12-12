@@ -26,3 +26,11 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Data files
+*.parquet
+*.csv
+futures_data/
+
+# Regime cache (generated)
+regime_cache.json
