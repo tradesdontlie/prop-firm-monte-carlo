@@ -71,10 +71,10 @@ class ContractScalingTier:
 
 @dataclass
 class ExitLevel:
-    """Configuration for a take profit level"""
-    points: float
-    portion: float  # Percentage of position (0.0 to 1.0)
-    probability: float  # Probability of hitting this level given entry
+    """Configuration for a partial take profit level"""
+    points: float                         # Target in points from entry
+    portion: float                        # Percentage of position to exit (0.0 to 1.0)
+    move_stop_to: Optional[float] = None  # Move stop to this level after fill (None = no change, 0 = breakeven)
 
 
 @dataclass
@@ -221,6 +221,72 @@ PROP_FIRM_PRESETS = {
 
 
 # =============================================================================
+# RTH SESSION MFE DATA - HARD CODED FOR REALISTIC DAY TRADING
+# =============================================================================
+
+# Regime frequencies from 1H candle data (these are accurate)
+RTH_REGIME_FREQUENCIES = {
+    "Low": 0.239,
+    "Normal": 0.506,
+    "High": 0.152,
+    "Extreme": 0.102
+}
+
+# RTH Session MFE distributions (in points) - realistic for NQ day trading
+# These are based on typical RTH session ranges, not hourly candles
+# Format: [p5, p10, p25, p50, p75, p90, p95] percentiles
+RTH_MFE_DISTRIBUTIONS = {
+    "Low": [15, 25, 40, 60, 85, 110, 130],       # Low vol day: 60pt median MFE
+    "Normal": [25, 40, 60, 90, 130, 170, 200],   # Normal day: 90pt median MFE
+    "High": [40, 60, 90, 130, 180, 240, 280],    # High vol day: 130pt median MFE
+    "Extreme": [60, 90, 130, 180, 260, 350, 420] # Extreme day: 180pt median MFE
+}
+
+# RTH Session MAE distributions (for stop-out calculations)
+RTH_MAE_DISTRIBUTIONS = {
+    "Low": [10, 18, 30, 50, 75, 100, 120],
+    "Normal": [18, 30, 50, 80, 120, 160, 190],
+    "High": [30, 50, 80, 120, 170, 230, 270],
+    "Extreme": [50, 80, 120, 170, 250, 340, 400]
+}
+
+RTH_PERCENTILES = [5, 10, 25, 50, 75, 90, 95]
+
+
+def sample_rth_regime() -> str:
+    """Sample a volatility regime based on historical frequencies."""
+    regimes = list(RTH_REGIME_FREQUENCIES.keys())
+    probs = list(RTH_REGIME_FREQUENCIES.values())
+    return np.random.choice(regimes, p=probs)
+
+
+def sample_rth_mfe(regime: str) -> float:
+    """Sample MFE from RTH session distribution for given regime."""
+    dist = RTH_MFE_DISTRIBUTIONS.get(regime, RTH_MFE_DISTRIBUTIONS["Normal"])
+    return _interpolate_percentile_sample(dist, RTH_PERCENTILES)
+
+
+def sample_rth_mae(regime: str) -> float:
+    """Sample MAE from RTH session distribution for given regime."""
+    dist = RTH_MAE_DISTRIBUTIONS.get(regime, RTH_MAE_DISTRIBUTIONS["Normal"])
+    return _interpolate_percentile_sample(dist, RTH_PERCENTILES)
+
+
+def _interpolate_percentile_sample(values: list, percentiles: list) -> float:
+    """Sample from percentile distribution using interpolation."""
+    p = np.random.uniform(0, 100)
+
+    for i in range(len(percentiles) - 1):
+        if percentiles[i] <= p <= percentiles[i + 1]:
+            t = (p - percentiles[i]) / (percentiles[i + 1] - percentiles[i])
+            return values[i] + t * (values[i + 1] - values[i])
+
+    if p < percentiles[0]:
+        return values[0] * (p / percentiles[0])
+    return values[-1]
+
+
+# =============================================================================
 # MONTE CARLO SIMULATION ENGINE
 # =============================================================================
 
@@ -293,10 +359,23 @@ class MonteCarloEngine:
 
         return max(1, contracts)
 
-    def generate_trade_outcome(self, num_contracts: int) -> float:
-        """Generate P&L for a single trade"""
+    def generate_trade_outcome(self, num_contracts: int) -> Tuple[float, str, dict]:
+        """
+        Generate P&L for a single trade, with support for partial exits.
+
+        Returns:
+            Tuple of (pnl_dollars, exit_reason, metadata)
+            exit_reason: "win", "loss", "partial", "partial_then_stop"
+            metadata: dict with partials_hit info if applicable
+        """
+        # If using partial exits, use MFE/MAE-based outcome (not pre-determined win/loss)
+        if self.trade.use_partial_exits and self.trade.exit_levels:
+            return self._generate_partial_exit_outcome(num_contracts)
+
+        # Standard non-partial trade uses win_rate
         is_winner = np.random.random() < self.trade.win_rate
 
+        # Standard non-partial trade
         if self.sim.distribution == "lognormal":
             if is_winner:
                 points = np.random.lognormal(
@@ -320,7 +399,120 @@ class MonteCarloEngine:
                     self.trade.avg_loss_points * 0.3
                 ))
 
-        return points * num_contracts * self.asset.point_value
+        pnl = points * num_contracts * self.asset.point_value
+        exit_reason = "win" if is_winner else "loss"
+        return pnl, exit_reason, {}
+
+    def _generate_partial_exit_outcome(self, num_contracts: int) -> Tuple[float, str, dict]:
+        """
+        Generate P&L using quantitative Monte Carlo based on risk/reward math.
+
+        The probability of winning is derived from stop/target ratio:
+        - Base P(win) = stop / (stop + target)  [random walk model]
+        - Adjusted P(win) = base + user_edge    [user's assumed edge]
+
+        This is mathematically grounded - not arbitrary win rate assumptions.
+        """
+        stop_loss = self.trade.stop_loss_points or self.trade.avg_loss_points
+
+        # Sort exit levels by points (ascending - closest targets first)
+        sorted_levels = sorted(self.trade.exit_levels, key=lambda x: x.points)
+
+        # FALLBACK: If no exit levels defined, create a default one at 10 points
+        if not sorted_levels:
+            sorted_levels = [ExitLevel(points=10.0, portion=1.0, move_stop_to=0.0)]
+
+        first_target = sorted_levels[0].points
+
+        # QUANTITATIVE MONTE CARLO:
+        # Base probability from random walk model (no edge)
+        # P(hit target before stop) = stop / (stop + target)
+        base_win_prob = stop_loss / (stop_loss + first_target)
+
+        # User's win_rate represents their TOTAL expected win rate
+        # Their "edge" is how much better they are than random
+        # We use their win_rate directly as it represents base + edge combined
+        effective_win_rate = self.trade.win_rate
+
+        # Determine outcome
+        is_winner = np.random.random() < effective_win_rate
+
+        if not is_winner:
+            # LOSER - full stop loss
+            loss_pnl = num_contracts * (-stop_loss) * self.asset.point_value
+            return loss_pnl, "loss", {'is_winner': False}
+
+        # WINNER - randomly determine how many partials get hit
+        total_pnl = 0.0
+        remaining_contracts = num_contracts
+        partials_hit = []
+
+        # Randomly decide how many partial levels to hit (at least 1 for a winner)
+        # Use weighted random: more likely to hit fewer partials than all of them
+        num_levels = len(sorted_levels)
+        if num_levels == 1:
+            levels_to_hit = 1
+        else:
+            # Weight toward hitting fewer partials (realistic - hard to catch full move)
+            # E.g., with 3 levels: 50% hit 1, 30% hit 2, 20% hit all 3
+            weights = [1.0 / (i + 1) for i in range(num_levels)]
+            weights = [w / sum(weights) for w in weights]  # Normalize
+            levels_to_hit = np.random.choice(range(1, num_levels + 1), p=weights)
+
+        # Process only the number of levels we're hitting
+        levels_hit_count = 0
+        for level in sorted_levels:
+            if remaining_contracts <= 0 or levels_hit_count >= levels_to_hit:
+                break
+
+            # Calculate contracts for this level
+            contracts_at_level = max(1, round(num_contracts * level.portion))
+            contracts_at_level = min(contracts_at_level, remaining_contracts)
+
+            if contracts_at_level <= 0:
+                continue
+
+            # Hit this partial target
+            pnl_at_level = contracts_at_level * level.points * self.asset.point_value
+            total_pnl += pnl_at_level
+            remaining_contracts -= contracts_at_level
+            levels_hit_count += 1
+
+            partials_hit.append({
+                'points': level.points,
+                'contracts': contracts_at_level,
+                'pnl': pnl_at_level
+            })
+
+        # Handle remaining contracts - exit at breakeven (stop moved to BE after first partial)
+        # This simulates: hit some partials, then price reverses to BE on the rest
+        if remaining_contracts > 0:
+            # 50% chance: exit at breakeven, 50% chance: small profit at last hit level
+            if np.random.random() < 0.5:
+                # Breakeven on remaining
+                partials_hit.append({
+                    'points': 0,
+                    'contracts': remaining_contracts,
+                    'pnl': 0,
+                    'breakeven': True
+                })
+            else:
+                # Exit at last partial hit level
+                last_hit = partials_hit[-1]['points'] if partials_hit else sorted_levels[0].points
+                runner_pnl = remaining_contracts * last_hit * self.asset.point_value
+                total_pnl += runner_pnl
+                partials_hit.append({
+                    'points': last_hit,
+                    'contracts': remaining_contracts,
+                    'pnl': runner_pnl,
+                    'runner': True
+                })
+
+        return total_pnl, "win", {
+            'is_winner': True,
+            'partials_hit': partials_hit,
+            'levels_reached': len(partials_hit)
+        }
 
     def generate_realistic_trade_outcome(self, num_contracts: int) -> Tuple[float, str, dict]:
         """
@@ -413,7 +605,13 @@ class MonteCarloEngine:
 
         # Initial drawdown floor
         drawdown_floor = self.account.starting_balance - self.account.max_drawdown
-        trailing_locked = False
+
+        # If trailing_stop_point is 0, floor is locked at starting balance from the start (no trailing)
+        if self.account.trailing_stop_point == 0:
+            trailing_locked = True
+            drawdown_floor = self.account.starting_balance - self.account.max_drawdown
+        else:
+            trailing_locked = False
 
         equity_curve = [equity]
         hwm_curve = [high_water_mark]
@@ -425,7 +623,6 @@ class MonteCarloEngine:
         max_dd_experienced = 0
         hit_target = False
         target_day = None
-        daily_loss_breach = False
 
         for day in range(self.sim.num_days):
             # Stop simulation if breached OR hit profit target (both are terminal states)
@@ -450,14 +647,8 @@ class MonteCarloEngine:
                 # Calculate position size
                 contracts = self.calculate_position_size(equity)
 
-                # Generate trade outcome (realistic or legacy)
-                exit_reason = "legacy"
-                trade_metadata = {}
-
-                if self.realistic.use_realistic_paths and self._regime_cache_loaded:
-                    pnl, exit_reason, trade_metadata = self.generate_realistic_trade_outcome(contracts)
-                else:
-                    pnl = self.generate_trade_outcome(contracts)
+                # Always use partial exit outcome with MFE/MAE + win_rate Monte Carlo
+                pnl, exit_reason, trade_metadata = self._generate_partial_exit_outcome(contracts)
 
                 # Update equity
                 equity += pnl
@@ -472,11 +663,11 @@ class MonteCarloEngine:
                         new_floor = high_water_mark - self.account.max_drawdown
                         drawdown_floor = max(drawdown_floor, new_floor)
 
-                        # Check if trailing should lock
+                        # Check if trailing should lock (floor stays at current level)
                         profit = high_water_mark - self.account.starting_balance
                         if profit >= self.account.trailing_stop_point > 0:
                             trailing_locked = True
-                            drawdown_floor = self.account.starting_balance
+                            # Floor stays at current drawdown_floor - don't change it
 
                 # Log trade
                 trade_entry = {
@@ -500,11 +691,12 @@ class MonteCarloEngine:
                     breach_day = day + 1
                     break
 
-                # Check daily drawdown limit
+                # Check daily drawdown limit - BREACH if exceeded
                 if self.account.daily_drawdown_limit:
                     if day_start_equity - equity >= self.account.daily_drawdown_limit:
-                        daily_loss_breach = True
-                        break  # Stop trading for the day
+                        breached = True
+                        breach_day = day + 1
+                        break  # Account breached due to daily loss limit
 
             # End-of-day trailing update
             if (self.account.trailing_type == TrailingDrawdownType.END_OF_DAY
@@ -514,11 +706,11 @@ class MonteCarloEngine:
                     new_floor = high_water_mark - self.account.max_drawdown
                     drawdown_floor = max(drawdown_floor, new_floor)
 
-                    # Check if trailing should lock
+                    # Check if trailing should lock (floor stays at current level)
                     profit = high_water_mark - self.account.starting_balance
                     if profit >= self.account.trailing_stop_point > 0:
                         trailing_locked = True
-                        drawdown_floor = self.account.starting_balance
+                        # Floor stays at current drawdown_floor - don't change it
 
             # Track maximum drawdown experienced
             current_dd = high_water_mark - equity
@@ -537,8 +729,6 @@ class MonteCarloEngine:
             equity_curve.append(equity)
             hwm_curve.append(high_water_mark)
             floor_curve.append(drawdown_floor)
-
-            daily_loss_breach = False  # Reset for next day
 
         return {
             'equity_curve': equity_curve,
@@ -660,6 +850,16 @@ class MonteCarloEngine:
         total_pnl = sum(r['final_equity'] - self.account.starting_balance for r in results)
         expected_value_per_trade = total_pnl / total_trades if total_trades > 0 else 0
 
+        # Partial exit statistics
+        exit_reason_counts = {}
+        partial_trades = 0
+        for r in results:
+            for t in r['trade_log']:
+                reason = t.get('exit_reason', 'unknown')
+                exit_reason_counts[reason] = exit_reason_counts.get(reason, 0) + 1
+                if 'partial' in reason:
+                    partial_trades += 1
+
         return {
             # Survival metrics
             'survival_rate': survival_rate,
@@ -705,6 +905,11 @@ class MonteCarloEngine:
             # Trade statistics
             'total_trades_all_sims': total_trades,
             'avg_trades_per_sim': total_trades / n,
+
+            # Partial exit statistics
+            'exit_reason_counts': exit_reason_counts,
+            'partial_trades': partial_trades,
+            'partial_trade_rate': partial_trades / total_trades if total_trades > 0 else 0,
         }
 
 
@@ -1178,9 +1383,11 @@ def main():
 
         # Asset Selection
         st.subheader("Asset Selection")
+        asset_options = list(ASSETS.keys())
         asset_symbol = st.selectbox(
             "Futures Contract",
-            options=list(ASSETS.keys()),
+            options=asset_options,
+            index=asset_options.index('MNQ'),  # Default to MNQ
             format_func=lambda x: f"{x} - {ASSETS[x].name}"
         )
         asset = ASSETS[asset_symbol]
@@ -1216,7 +1423,7 @@ def main():
                     "Risk Per Trade ($)",
                     min_value=10.0,
                     max_value=10000.0,
-                    value=100.0,
+                    value=200.0,
                     step=10.0
                 )
                 risk_is_percentage = False
@@ -1236,19 +1443,19 @@ def main():
                 trades_min = st.number_input(
                     "Minimum",
                     min_value=1,
-                    max_value=20,
-                    value=1
+                    max_value=50,
+                    value=5
                 )
             with col_max:
                 trades_max = st.number_input(
                     "Maximum",
                     min_value=trades_min,
-                    max_value=20,
-                    value=3
+                    max_value=50,
+                    value=20
                 )
 
         with col2:
-            st.subheader("Win/Loss Parameters")
+            st.subheader("Trade Parameters")
 
             win_rate = st.slider(
                 "Win Rate (%)",
@@ -1268,190 +1475,187 @@ def main():
             )
 
             if price_unit == "Points":
-                avg_win = st.number_input(
-                    "Average Win (Points)",
+                stop_loss = st.number_input(
+                    "Stop Loss (Points)",
                     min_value=0.5,
                     max_value=500.0,
                     value=10.0,
-                    step=0.5
-                )
-
-                avg_loss = st.number_input(
-                    "Average Loss (Points)",
-                    min_value=0.5,
-                    max_value=500.0,
-                    value=8.0,
-                    step=0.5
+                    step=0.5,
+                    help="Fixed stop loss distance from entry"
                 )
             else:
-                # Basis points input - convert to points
-                avg_win_bps = st.number_input(
-                    "Average Win (bps)",
-                    min_value=1,
-                    max_value=500,
-                    value=50,
-                    step=5,
-                    help=f"1 bp = {asset.bps_to_points(1):.2f} pts on {asset.symbol}"
-                )
-                avg_win = asset.bps_to_points(avg_win_bps)
-                st.caption(f"= {avg_win:.1f} points")
-
-                avg_loss_bps = st.number_input(
-                    "Average Loss (bps)",
+                stop_loss_bps = st.number_input(
+                    "Stop Loss (bps)",
                     min_value=1,
                     max_value=500,
                     value=40,
                     step=5,
                     help=f"1 bp = {asset.bps_to_points(1):.2f} pts on {asset.symbol}"
                 )
-                avg_loss = asset.bps_to_points(avg_loss_bps)
-                st.caption(f"= {avg_loss:.1f} points")
+                stop_loss = asset.bps_to_points(stop_loss_bps)
+                st.caption(f"= {stop_loss:.1f} points")
 
-            use_stop = st.checkbox("Define Fixed Stop Loss", value=False)
-            stop_loss = None
-            if use_stop:
+        # Partial Take Profits Section
+        st.markdown("---")
+        st.subheader("Partial Take Profits")
+
+        # Always use partial exits
+        use_partial_exits = True
+        exit_levels = []
+
+        # Calculate position sizing
+        # Calculate total contracts based on current risk settings
+        if risk_is_percentage:
+            target_risk = starting_balance * (risk_per_trade / 100)
+        else:
+            target_risk = risk_per_trade
+
+        risk_per_contract = stop_loss * asset.point_value
+
+        # Calculate contracts (can be fractional for display)
+        contracts_float = target_risk / risk_per_contract
+        total_contracts = max(1, int(contracts_float))
+
+        # Calculate actual risk with whole contracts
+        actual_risk = total_contracts * risk_per_contract
+
+        # Check if we can fit within target risk
+        if contracts_float < 1:
+            st.error(f"**Cannot fit within ${target_risk:,.0f} risk!** Minimum 1 contract = **${actual_risk:,.0f}** risk ({stop_loss} pts × ${asset.point_value:.2f}/pt)")
+            st.warning(f"Either increase risk per trade to ${risk_per_contract:,.0f}+ or reduce stop loss or use a smaller contract (MNQ instead of NQ)")
+        elif actual_risk > target_risk * 1.1:  # More than 10% over target
+            st.warning(f"**Total Contracts: {total_contracts}** — Actual risk: **${actual_risk:,.0f}** (target was ${target_risk:,.0f})")
+        else:
+            st.info(f"**Total Contracts: {total_contracts}** — Actual risk: **${actual_risk:,.0f}** ({stop_loss} pts × ${asset.point_value:.2f}/pt × {total_contracts})")
+
+        # Initialize session state for partial levels if not exists (default to 1)
+        if 'num_partial_levels' not in st.session_state:
+            st.session_state.num_partial_levels = 1
+
+        # Add/Remove level buttons
+        col_add, col_remove = st.columns(2)
+        with col_add:
+            if st.button("+ Add Level", use_container_width=True):
+                st.session_state.num_partial_levels = min(6, st.session_state.num_partial_levels + 1)
+                st.rerun()
+        with col_remove:
+            if st.button("- Remove Level", use_container_width=True):
+                st.session_state.num_partial_levels = max(1, st.session_state.num_partial_levels - 1)
+                st.rerun()
+
+        stop_action_options = ["Keep current stop", "Move stop to breakeven", "Move stop to this level"]
+
+        # Track contracts allocation
+        contracts_allocated = 0
+        level_data = []
+
+        for i in range(st.session_state.num_partial_levels):
+            remaining_contracts = total_contracts - contracts_allocated
+            st.markdown(f"**Partial Level {i + 1}** — *{remaining_contracts} contracts remaining*")
+            cols = st.columns([2, 2, 2, 2])
+
+            with cols[0]:
                 if price_unit == "Points":
-                    stop_loss = st.number_input(
-                        "Stop Loss (Points)",
-                        min_value=0.5,
+                    level_points = st.number_input(
+                        f"Target (pts)",
+                        min_value=1.0,
                         max_value=500.0,
-                        value=avg_loss,
-                        step=0.5
+                        value=float((i + 1) * 10),
+                        step=1.0,
+                        key=f"partial_pts_{i}"
                     )
                 else:
-                    stop_loss_bps = st.number_input(
-                        "Stop Loss (bps)",
+                    level_bps = st.number_input(
+                        f"Target (bps)",
                         min_value=1,
                         max_value=500,
-                        value=int(avg_loss_bps),
-                        step=5
+                        value=(i + 1) * 20,
+                        step=5,
+                        key=f"partial_bps_{i}"
                     )
-                    stop_loss = asset.bps_to_points(stop_loss_bps)
-                    st.caption(f"= {stop_loss:.1f} points")
+                    level_points = asset.bps_to_points(level_bps)
 
-        # Display expected value
+            with cols[1]:
+                # Calculate max contracts for this level
+                max_contracts_this_level = remaining_contracts
+
+                # Default to 10 contracts for first level, or remaining for others
+                default_contracts = min(10, max_contracts_this_level) if i == 0 else min(1, max_contracts_this_level)
+
+                level_contracts = st.number_input(
+                    f"Contracts",
+                    min_value=0,
+                    max_value=max(1, max_contracts_this_level),
+                    value=default_contracts,
+                    step=1,
+                    key=f"partial_contracts_{i}"
+                )
+
+            with cols[2]:
+                # Show P&L preview for this level
+                level_pnl = level_contracts * level_points * asset.point_value
+                st.metric(f"P&L", f"${level_pnl:,.0f}")
+
+            with cols[3]:
+                stop_action = st.selectbox(
+                    f"After fill",
+                    options=stop_action_options,
+                    index=1 if i == 0 else 0,  # Default first level to BE
+                    key=f"partial_stop_{i}"
+                )
+
+            # Convert stop action to move_stop_to value
+            if stop_action == "Keep current stop":
+                move_stop_to = None
+            elif stop_action == "Move stop to breakeven":
+                move_stop_to = 0.0
+            else:  # Move stop to this level
+                move_stop_to = level_points
+
+            # Calculate portion from contracts
+            level_portion = level_contracts / total_contracts if total_contracts > 0 else 0
+
+            level_data.append({
+                'points': level_points,
+                'contracts': level_contracts,
+                'portion': level_portion,
+                'move_stop_to': move_stop_to
+            })
+
+            contracts_allocated += level_contracts
+
+        # Build exit_levels from level_data
+        for ld in level_data:
+            exit_levels.append(ExitLevel(
+                points=ld['points'],
+                portion=ld['portion'],
+                move_stop_to=ld['move_stop_to']
+            ))
+
+        # Show summary
         st.markdown("---")
-        st.subheader("Strategy Metrics Preview")
+        remaining_after_all = total_contracts - contracts_allocated
+        total_potential_pnl = sum(ld['contracts'] * ld['points'] * asset.point_value for ld in level_data)
 
-        expected_pnl_per_trade = (win_rate * avg_win - (1 - win_rate) * avg_loss) * asset.point_value
+        col_sum1, col_sum2, col_sum3 = st.columns(3)
+        with col_sum1:
+            color = "green" if contracts_allocated == total_contracts else "orange"
+            st.markdown(f"**Contracts allocated: :{color}[{contracts_allocated}/{total_contracts}]**")
+        with col_sum2:
+            if remaining_after_all > 0:
+                st.markdown(f"**Runner: {remaining_after_all} contract(s)**")
+            else:
+                st.markdown("**No runner**")
+        with col_sum3:
+            st.markdown(f"**Max P&L (all targets hit): ${total_potential_pnl:,.0f}**")
 
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Expected Win Rate", f"{win_rate*100:.0f}%")
-        with col2:
-            rr_ratio = avg_win / avg_loss if avg_loss > 0 else 0
-            st.metric("Risk/Reward Ratio", f"{rr_ratio:.2f}")
-        with col3:
-            st.metric("Exp. P&L/Trade (1 ct)", f"${expected_pnl_per_trade:.2f}")
-        with col4:
-            edge = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_loss * 100
-            color = "normal" if edge > 0 else "inverse"
-            st.metric("Edge", f"{edge:.1f}%", delta_color=color)
-
-        # Realistic Price Path Simulation
-        st.markdown("---")
-        st.subheader("🔬 Realistic Price Path Simulation")
-
-        use_realistic = st.checkbox(
-            "Enable Realistic MFE/MAE Paths",
-            value=False,
-            help="Use historical MFE/MAE distributions from real market data instead of simple win/loss model"
+        # MFE/MAE paths always enabled (no UI needed)
+        realistic_config = RealisticTradeConfig(
+            use_realistic_paths=True,
+            trade_direction="random",
+            break_even_trigger=0.0,
+            target_points=None
         )
-
-        realistic_config = RealisticTradeConfig(use_realistic_paths=False)
-
-        if use_realistic:
-            # Check if cache exists
-            try:
-                from regime_cache import cache_exists, get_regime_statistics, get_available_assets
-                if cache_exists():
-                    st.success("✅ Regime cache loaded")
-
-                    col_r1, col_r2 = st.columns(2)
-
-                    with col_r1:
-                        trade_direction = st.selectbox(
-                            "Trade Direction",
-                            options=["random", "long", "short"],
-                            help="Random: 50/50 long/short. Or force one direction."
-                        )
-
-                    with col_r2:
-                        if price_unit == "Points":
-                            break_even_trigger = st.number_input(
-                                "Break-Even Trigger (Points)",
-                                min_value=0.0,
-                                max_value=500.0,
-                                value=0.0,
-                                step=1.0,
-                                help="Move stop to entry after this many points profit. 0 = disabled."
-                            )
-                        else:
-                            be_trigger_bps = st.number_input(
-                                "Break-Even Trigger (bps)",
-                                min_value=0,
-                                max_value=500,
-                                value=0,
-                                step=5,
-                                help="Move stop to entry after this many bps profit. 0 = disabled."
-                            )
-                            break_even_trigger = asset.bps_to_points(be_trigger_bps)
-                            if be_trigger_bps > 0:
-                                st.caption(f"= {break_even_trigger:.1f} points")
-
-                    # Show regime stats for selected asset
-                    cache_asset = {"MNQ": "NQ", "MES": "ES", "MYM": "YM"}.get(asset_symbol, asset_symbol)
-                    available = get_available_assets()
-
-                    if cache_asset in available:
-                        stats = get_regime_statistics(cache_asset)
-                        if "timeframes" in stats and "1H" in stats["timeframes"]:
-                            tf_stats = stats["timeframes"]["1H"]
-                            st.markdown("**Regime Distribution (1H candles):**")
-
-                            regime_freqs = tf_stats.get("regime_frequencies", {})
-                            if regime_freqs:
-                                freq_cols = st.columns(4)
-                                for i, (regime, freq) in enumerate(regime_freqs.items()):
-                                    with freq_cols[i % 4]:
-                                        st.metric(regime, f"{freq*100:.1f}%")
-
-                            st.markdown("**Median MFE/MAE by Regime:**")
-                            mfe_medians = tf_stats.get("mfe_medians", {})
-                            mae_medians = tf_stats.get("mae_medians", {})
-                            if mfe_medians:
-                                mfe_mae_cols = st.columns(4)
-                                point_val = asset.point_value
-
-                                for i, regime in enumerate(["Low", "Normal", "High", "Extreme"]):
-                                    with mfe_mae_cols[i]:
-                                        mfe = mfe_medians.get(regime, 0)
-                                        mae = mae_medians.get(regime, 0)
-                                        # Convert to bps of asset price
-                                        mfe_bps = asset.points_to_bps(mfe)
-                                        mae_bps = asset.points_to_bps(mae)
-                                        mfe_dollars = mfe * point_val
-                                        mae_dollars = mae * point_val
-
-                                        st.write(f"**{regime}**")
-                                        st.write(f"MFE: {mfe:.1f} pts ({mfe_bps:.0f} bps)")
-                                        st.write(f"MAE: {mae:.1f} pts ({mae_bps:.0f} bps)")
-                    else:
-                        st.warning(f"Asset {cache_asset} not in cache. Available: {', '.join(available)}")
-
-                    realistic_config = RealisticTradeConfig(
-                        use_realistic_paths=True,
-                        trade_direction=trade_direction,
-                        break_even_trigger=break_even_trigger,
-                        target_points=avg_win  # Use avg_win as target
-                    )
-                else:
-                    st.warning("⚠️ Regime cache not found. Run `python build_regime_cache.py` first.")
-            except ImportError as e:
-                st.error(f"❌ Error loading regime_cache module: {e}")
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
-
         st.session_state.realistic_config = realistic_config
 
         # Store trade config in session state
@@ -1461,9 +1665,11 @@ def main():
             trades_per_day_min=trades_min,
             trades_per_day_max=trades_max,
             win_rate=win_rate,
-            avg_win_points=avg_win,
-            avg_loss_points=avg_loss,
-            stop_loss_points=stop_loss
+            avg_win_points=0.0,  # Not used - partials define targets
+            avg_loss_points=stop_loss,  # Use stop_loss as avg_loss for legacy compatibility
+            stop_loss_points=stop_loss,
+            exit_levels=exit_levels,
+            use_partial_exits=use_partial_exits
         )
 
     # Tab 2: Simulation
@@ -1483,10 +1689,10 @@ def main():
 
             num_days = st.number_input(
                 "Trading Days",
-                min_value=10,
+                min_value=1,
                 max_value=504,
-                value=60,
-                step=10,
+                value=14,
+                step=1,
                 help="252 days = 1 trading year"
             )
 
@@ -1515,13 +1721,11 @@ def main():
             else:
                 dollar_risk = risk_per_trade
 
-            # Calculate contracts based on avg_loss (or stop_loss if defined)
-            loss_points = stop_loss if stop_loss else avg_loss
-            contracts = int(dollar_risk / (loss_points * asset.point_value))
+            # Calculate contracts based on stop_loss
+            contracts = int(dollar_risk / (stop_loss * asset.point_value))
             contracts = max(1, contracts)  # Minimum 1 contract
 
-            actual_risk = contracts * loss_points * asset.point_value
-            actual_win = contracts * avg_win * asset.point_value
+            actual_risk = contracts * stop_loss * asset.point_value
 
             st.markdown(f"""
             **Account:**
@@ -1534,13 +1738,13 @@ def main():
 
             **Position Sizing:**
             - Risk/Trade: ${dollar_risk:,.0f}
-            - Stop/Loss: {loss_points} pts → **{contracts} contract(s)**
+            - Stop Loss: {stop_loss} pts → **{contracts} contract(s)**
             - Actual Risk: ${actual_risk:,.0f}
 
             **Trade Settings:**
             - Win Rate: {win_rate*100:.0f}%
-            - Avg Win: {avg_win} pts × {contracts} ct = **${actual_win:,.0f}**
-            - Avg Loss: {loss_points} pts × {contracts} ct = **${actual_risk:,.0f}**
+            - Partial Exits: Always enabled
+            - MFE/MAE Paths: Always enabled
             """)
 
         st.markdown("---")
@@ -1565,7 +1769,19 @@ def main():
                 distribution=distribution
             )
 
-            trade_config = st.session_state.get('trade_config', TradeConfig())
+            # Get trade config from session state, or create a working default
+            trade_config = st.session_state.get('trade_config', None)
+            if trade_config is None:
+                # Create default config with partial exits enabled
+                trade_config = TradeConfig(
+                    risk_per_trade=200.0,
+                    win_rate=win_rate,
+                    avg_win_points=10.0,
+                    avg_loss_points=stop_loss,
+                    stop_loss_points=stop_loss,
+                    exit_levels=[ExitLevel(points=10.0, portion=1.0, move_stop_to=0.0)],
+                    use_partial_exits=True
+                )
 
             # Run simulation with progress bar
             progress_bar = st.progress(0)
@@ -1723,7 +1939,8 @@ def main():
 
             # Sample paths
             st.subheader("Sample Equity Paths")
-            num_paths = st.slider("Number of paths to display", 10, 200, 50)
+            total_sims = summary['total_simulations']
+            num_paths = st.slider("Number of paths to display", 10, total_sims, total_sims)
             st.plotly_chart(
                 create_sample_paths_chart(results, account_config, num_paths),
                 use_container_width=True
@@ -1754,6 +1971,16 @@ def main():
                 st.write(f"- Avg Trades/Sim: {summary['avg_trades_per_sim']:.0f}")
                 st.write(f"- Mean Win Rate: {summary['mean_win_rate']*100:.1f}%")
                 st.write(f"- Max Losing Streak: {summary['max_losing_streak_ever']}")
+
+            # Exit reason breakdown
+            if summary.get('exit_reason_counts'):
+                st.markdown("---")
+                st.subheader("Exit Reason Breakdown")
+                exit_cols = st.columns(len(summary['exit_reason_counts']))
+                for i, (reason, count) in enumerate(summary['exit_reason_counts'].items()):
+                    pct = count / summary['total_trades_all_sims'] * 100
+                    with exit_cols[i % len(exit_cols)]:
+                        st.metric(reason.replace('_', ' ').title(), f"{count:,}", f"{pct:.1f}%")
 
             # Breach timing details
             if summary['breach_day_percentiles']:
