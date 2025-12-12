@@ -1509,6 +1509,20 @@ def main():
         with col2:
             st.subheader("Configuration Summary")
 
+            # Calculate actual contracts and dollar values
+            if risk_is_percentage:
+                dollar_risk = starting_balance * (risk_per_trade / 100)
+            else:
+                dollar_risk = risk_per_trade
+
+            # Calculate contracts based on avg_loss (or stop_loss if defined)
+            loss_points = stop_loss if stop_loss else avg_loss
+            contracts = int(dollar_risk / (loss_points * asset.point_value))
+            contracts = max(1, contracts)  # Minimum 1 contract
+
+            actual_risk = contracts * loss_points * asset.point_value
+            actual_win = contracts * avg_win * asset.point_value
+
             st.markdown(f"""
             **Account:**
             - Starting Balance: ${starting_balance:,.0f}
@@ -1518,11 +1532,15 @@ def main():
 
             **Asset:** {asset_symbol} (${asset.point_value:.2f}/point)
 
+            **Position Sizing:**
+            - Risk/Trade: ${dollar_risk:,.0f}
+            - Stop/Loss: {loss_points} pts → **{contracts} contract(s)**
+            - Actual Risk: ${actual_risk:,.0f}
+
             **Trade Settings:**
-            - Risk/Trade: {'$' + str(risk_per_trade) if not risk_is_percentage else str(risk_per_trade) + '%'}
             - Win Rate: {win_rate*100:.0f}%
-            - Avg Win: {avg_win} pts (${avg_win * asset.point_value:.2f})
-            - Avg Loss: {avg_loss} pts (${avg_loss * asset.point_value:.2f})
+            - Avg Win: {avg_win} pts × {contracts} ct = **${actual_win:,.0f}**
+            - Avg Loss: {loss_points} pts × {contracts} ct = **${actual_risk:,.0f}**
             """)
 
         st.markdown("---")
