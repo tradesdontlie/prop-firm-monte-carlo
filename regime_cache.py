@@ -18,7 +18,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-DEFAULT_CACHE_PATH = Path.home() / ".queen_streamlit" / "regime_cache.json"
+# Look for cache in local directory first, then fall back to home directory
+LOCAL_CACHE_PATH = Path(__file__).parent / "regime_cache.json"
+HOME_CACHE_PATH = Path.home() / ".queen_streamlit" / "regime_cache.json"
+DEFAULT_CACHE_PATH = LOCAL_CACHE_PATH if LOCAL_CACHE_PATH.exists() else HOME_CACHE_PATH
 
 # Cache is loaded once and stored globally
 _REGIME_CACHE: Optional[dict] = None
@@ -458,9 +461,9 @@ def get_regime_statistics(asset: str) -> dict:
 
 # Convenience function to check if cache exists
 def cache_exists(cache_path: Optional[Path] = None) -> bool:
-    """Check if the regime cache file exists."""
+    """Check if the regime cache file exists (checks local and home directory)."""
     if cache_path is None:
-        cache_path = DEFAULT_CACHE_PATH
+        return LOCAL_CACHE_PATH.exists() or HOME_CACHE_PATH.exists()
     return cache_path.exists()
 
 
